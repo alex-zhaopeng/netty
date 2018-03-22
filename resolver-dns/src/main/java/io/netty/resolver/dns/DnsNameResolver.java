@@ -45,6 +45,7 @@ import io.netty.util.NetUtil;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.Promise;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
@@ -624,7 +625,7 @@ public class DnsNameResolver extends InetNameResolver {
         }
     }
 
-    private static <T> void trySuccess(Promise<T> promise, T result) {
+    static <T> void trySuccess(Promise<T> promise, T result) {
         if (!promise.trySuccess(result)) {
             logger.warn("Failed to notify success ({}) to a promise: {}", result, promise);
         }
@@ -638,40 +639,20 @@ public class DnsNameResolver extends InetNameResolver {
 
     private void doResolveUncached(String hostname,
                                    DnsRecord[] additionals,
-                                   Promise<InetAddress> promise,
+                                   final Promise<InetAddress> promise,
                                    DnsCache resolveCache) {
-        new SingleResolverContext(this, hostname, additionals, resolveCache,
-                                  dnsServerAddressStreamProvider.nameServerAddressStream(hostname)).resolve(promise);
-    }
-
-    static final class SingleResolverContext extends DnsNameResolverContext<InetAddress> {
-        SingleResolverContext(DnsNameResolver parent, String hostname,
-                              DnsRecord[] additionals, DnsCache resolveCache, DnsServerAddressStream nameServerAddrs) {
-            super(parent, hostname, additionals, resolveCache, nameServerAddrs);
-        }
-
-        @Override
-        DnsNameResolverContext<InetAddress> newResolverContext(DnsNameResolver parent, String hostname,
-                                                               DnsRecord[] additionals, DnsCache resolveCache,
-                                                               DnsServerAddressStream nameServerAddrs) {
-            return new SingleResolverContext(parent, hostname, additionals, resolveCache, nameServerAddrs);
-        }
-
-        @Override
-        boolean finishResolve(
-            Class<? extends InetAddress> addressType, List<DnsCacheEntry> resolvedEntries,
-            Promise<InetAddress> promise) {
-
-            final int numEntries = resolvedEntries.size();
-            for (int i = 0; i < numEntries; i++) {
-                final InetAddress a = resolvedEntries.get(i).address();
-                if (addressType.isInstance(a)) {
-                    trySuccess(promise, a);
-                    return true;
+        final Promise<List<InetAddress>> allPromise = executor().newPromise();
+        doResolveAllUncached(hostname, additionals, allPromise, resolveCache);
+        allPromise.addListener(new FutureListener<List<InetAddress>>() {
+            @Override
+            public void operationComplete(Future<List<InetAddress>> future) throws Exception {
+                if (future.isSuccess()) {
+                    trySuccess(promise, future.getNow().get(0));
+                } else {
+                    tryFailure(promise, future.cause());
                 }
             }
-            return false;
-        }
+        });
     }
 
     @Override
@@ -747,50 +728,13 @@ public class DnsNameResolver extends InetNameResolver {
         }
     }
 
-    static final class ListResolverContext extends DnsNameResolverContext<List<InetAddress>> {
-        ListResolverContext(DnsNameResolver parent, String hostname,
-                            DnsRecord[] additionals, DnsCache resolveCache, DnsServerAddressStream nameServerAddrs) {
-            super(parent, hostname, additionals, resolveCache, nameServerAddrs);
-        }
-
-        @Override
-        DnsNameResolverContext<List<InetAddress>> newResolverContext(
-                DnsNameResolver parent, String hostname,  DnsRecord[] additionals, DnsCache resolveCache,
-                DnsServerAddressStream nameServerAddrs) {
-            return new ListResolverContext(parent, hostname, additionals, resolveCache, nameServerAddrs);
-        }
-
-        @Override
-        boolean finishResolve(
-            Class<? extends InetAddress> addressType, List<DnsCacheEntry> resolvedEntries,
-            Promise<List<InetAddress>> promise) {
-
-            List<InetAddress> result = null;
-            final int numEntries = resolvedEntries.size();
-            for (int i = 0; i < numEntries; i++) {
-                final InetAddress a = resolvedEntries.get(i).address();
-                if (addressType.isInstance(a)) {
-                    if (result == null) {
-                        result = new ArrayList<InetAddress>(numEntries);
-                    }
-                    result.add(a);
-                }
-            }
-
-            if (result != null) {
-                promise.trySuccess(result);
-                return true;
-            }
-            return false;
-        }
-    }
-
     private void doResolveAllUncached(String hostname,
                                       DnsRecord[] additionals,
                                       Promise<List<InetAddress>> promise,
                                       DnsCache resolveCache) {
-        new ListResolverContext(this, hostname, additionals, resolveCache,
-                                dnsServerAddressStreamProvider.nameServerAddressStream(hostname)).resolve(promise);
+        final DnsServerAddressStream nameServerAddrs =
+                dnsServerAddressStreamProvider.nameServerAddressStream(hostname);
+        new DnsAddressResolveContext(this, hostname, additionals, nameServerAddrs, resolveCache).resolve(promise);
     }
 
     private static String hostname(String inetHost) {
